@@ -1,0 +1,5 @@
+## Interface: 11200
+## Title: ZoneWho
+## Notes: Players in your zone
+## Version: 1.1
+ZoneWho.lua
