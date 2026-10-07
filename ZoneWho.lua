@@ -1,5 +1,11 @@
-local UPDATE_SEC = 20
-local MAX_LINES  = 40
+-- ZoneWho v1.2
+-- Shows players in the current zone via background /who queries.
+-- Compatible with World of Warcraft 1.12.1 (Vanilla / VanillaPlus).
+
+local ADDON_VERSION = "1.2"
+local UPDATE_SEC    = 20
+local MAX_LINES     = 40
+local WHO_TIMEOUT   = 4   -- seconds to wait for WHO_LIST_UPDATE
 
 local CLASS_COLORS = {
   ["Warrior"] = "C79C6E",
@@ -14,33 +20,14 @@ local CLASS_COLORS = {
 }
 
 local frame, text
-local lastZone = ""
-local ticker = 0
-local suppressFriends = false
-local ourWho = false
+local lastZone   = ""
+local ticker     = 0
+local ourWho     = false   -- true while we are waiting for our own who response
+local pendingGuard = nil   -- temporary OnUpdate frame for timeout
 
--- оригинал ShowUIPanel (1.12 открывает Friends через него)
-local _ShowUIPanel = ShowUIPanel
-if _ShowUIPanel then
-  ShowUIPanel = function(f, a1, a2, a3)
-    if suppressFriends and f == FriendsFrame then
-      return
-    end
-    return _ShowUIPanel(f, a1, a2, a3)
-  end
-end
-
--- на всякий случай глушим и прямой Show
-if FriendsFrame then
-  local _FriendsShow = FriendsFrame.Show
-  FriendsFrame.Show = function(self)
-    if suppressFriends then
-      return
-    end
-    return _FriendsShow(self)
-  end
-end
-
+------------------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------------------
 local function C(name, class)
   local hex = CLASS_COLORS[class or ""] or "FFFFFF"
   return "|cff" .. hex .. (name or "?") .. "|r"
@@ -56,40 +43,68 @@ local function SetText(s)
   if text then text:SetText(s or "") end
 end
 
+-- Temporarily stop FriendsFrame from reacting to WHO_LIST_UPDATE
+-- so the Social/Who window never flashes open for our background queries.
+local function SilenceFriendsFrame()
+  if FriendsFrame then
+    FriendsFrame:UnregisterEvent("WHO_LIST_UPDATE")
+  end
+end
+
+local function RestoreFriendsFrame()
+  if FriendsFrame then
+    FriendsFrame:RegisterEvent("WHO_LIST_UPDATE")
+  end
+end
+
+local function ClearGuard()
+  if pendingGuard then
+    pendingGuard:SetScript("OnUpdate", nil)
+    pendingGuard = nil
+  end
+end
+
+local function FinishOurWho()
+  ourWho = false
+  ClearGuard()
+  RestoreFriendsFrame()
+end
+
+------------------------------------------------------------------------
+-- Who request / response
+------------------------------------------------------------------------
 local function RequestWho()
+  if ourWho then return end          -- already waiting for a previous request
+
   local z = Zone()
   if z == "" then return end
+
   lastZone = z
-  ourWho = true
-  suppressFriends = true
+  ourWho   = true
+
+  SilenceFriendsFrame()
 
   if SetWhoToUI then SetWhoToUI(1) end
   SendWho(string.format('z-"%s" 1-60', z))
 
-  -- страховка: если ответ who не придёт, не держим блок вечно
+  -- Safety timeout: if server never answers, restore UI handling
   local t = 0
-  local guard = CreateFrame("Frame")
-  guard:SetScript("OnUpdate", function()
+  pendingGuard = CreateFrame("Frame")
+  pendingGuard:SetScript("OnUpdate", function()
     t = t + arg1
-    if t > 3 or not ourWho then
-      suppressFriends = false
-      ourWho = false
-      guard:SetScript("OnUpdate", nil)
+    if t >= WHO_TIMEOUT then
+      FinishOurWho()
     end
   end)
 end
 
 local function OnWhoUpdate()
   if not ourWho then
-    -- чужой /who (ручной) — не трогаем UI
+    -- Manual /who from the player — leave FriendsFrame alone
     return
   end
-  ourWho = false
-  suppressFriends = false
 
-  if FriendsFrame and FriendsFrame:IsVisible() then
-    FriendsFrame:Hide()
-  end
+  FinishOurWho()
 
   local z = lastZone
   if z == "" then z = Zone() end
@@ -124,6 +139,9 @@ local function OnWhoUpdate()
   SetText(table.concat(lines, "\n"))
 end
 
+------------------------------------------------------------------------
+-- UI
+------------------------------------------------------------------------
 local function CreateUI()
   if frame then return end
 
@@ -135,9 +153,9 @@ local function CreateUI()
   frame:EnableMouse(true)
   frame:RegisterForDrag("LeftButton")
   frame:SetScript("OnDragStart", function() this:StartMoving() end)
-  frame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+  frame:SetScript("OnDragStop",  function() this:StopMovingOrSizing() end)
   frame:SetBackdrop({
-    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
     tile = true, tileSize = 16, edgeSize = 12,
     insets = { left = 3, right = 3, top = 3, bottom = 3 }
@@ -146,11 +164,11 @@ local function CreateUI()
 
   local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   title:SetPoint("TOP", frame, "TOP", 0, -6)
-  title:SetText("ZoneWho")
+  title:SetText("ZoneWho " .. ADDON_VERSION)
 
   text = frame:CreateFontString("ZoneWhoText", "OVERLAY", "GameFontHighlightSmall")
-  text:SetPoint("TOPLEFT", frame, "TOPLEFT", 8, -22)
-  text:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -8, 8)
+  text:SetPoint("TOPLEFT",     frame, "TOPLEFT",     8, -22)
+  text:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -8,  8)
   text:SetJustifyH("LEFT")
   text:SetJustifyV("TOP")
   SetText("|cffaaaaaaзагрузка...|r")
@@ -164,6 +182,7 @@ local function CreateUI()
     if event == "WHO_LIST_UPDATE" then
       OnWhoUpdate()
     else
+      -- zone change → request soon
       ticker = UPDATE_SEC - 1
     end
   end)
@@ -179,17 +198,25 @@ local function CreateUI()
   frame:Show()
 end
 
+------------------------------------------------------------------------
+-- Boot
+------------------------------------------------------------------------
 local boot = CreateFrame("Frame")
 boot:RegisterEvent("VARIABLES_LOADED")
 boot:SetScript("OnEvent", function()
   CreateUI()
   ticker = UPDATE_SEC - 2
+  DEFAULT_CHAT_FRAME:AddMessage("|cffFFD100ZoneWho|r v" .. ADDON_VERSION .. " loaded")
 end)
 
+------------------------------------------------------------------------
+-- Slash commands
+------------------------------------------------------------------------
 SLASH_ZONEWHO1 = "/zonewho"
 SlashCmdList["ZONEWHO"] = function(msg)
   msg = string.lower(tostring(msg or ""))
   if not frame then CreateUI() end
+
   if msg == "hide" then
     frame:Hide()
   elseif msg == "show" then
@@ -198,7 +225,14 @@ SlashCmdList["ZONEWHO"] = function(msg)
     RequestWho()
     DEFAULT_CHAT_FRAME:AddMessage("|cffFFD100ZoneWho:|r who sent")
   elseif msg == "debug" then
-    DEFAULT_CHAT_FRAME:AddMessage("Zone=" .. Zone() .. " n=" .. tostring(GetNumWhoResults and GetNumWhoResults() or "?"))
+    DEFAULT_CHAT_FRAME:AddMessage(
+      "ZoneWho v" .. ADDON_VERSION ..
+      "  zone=" .. Zone() ..
+      "  n=" .. tostring(GetNumWhoResults and GetNumWhoResults() or "?") ..
+      "  ourWho=" .. tostring(ourWho)
+    )
+  elseif msg == "version" or msg == "ver" then
+    DEFAULT_CHAT_FRAME:AddMessage("|cffFFD100ZoneWho|r version " .. ADDON_VERSION)
   else
     if frame:IsShown() then frame:Hide() else frame:Show() end
   end
